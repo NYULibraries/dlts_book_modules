@@ -1,0 +1,11 @@
+name = DLTS Book Display
+description = "Add a metadata view mode display to the node"
+package = DLTS
+
+; Core version (required)
+core = 7.x
+version = 7.x-0.1
+; PHP version requirement (optional)
+; php = 5.2
+
+project = "dlts_books"

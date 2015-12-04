@@ -202,7 +202,7 @@ function dlts_book_api_menu() {
  * checked, adding a check here might save an entity_load if the user's not
  * going to have access anyway, at the cost of an extra JOIN here.
  */
-function dlts_book_load($identifier, $language = 'en') {
+function dlts_book_load($identifier, $language = array('en', 'und')) {
 
   $query_parameters = drupal_get_query_parameters();
 
@@ -222,31 +222,98 @@ function dlts_book_load($identifier, $language = 'en') {
     ->fieldCondition('field_identifier', 'value', $identifier, '=')
     ->execute();
 
-  if (!empty($result['node'])) {
+  if ( !empty ( $result['node'] ) ) {
 
     $keys = array_keys( $result['node'] );
 
-    return node_load( array_pop( $keys ) );
+    return node_load ( array_pop ( $keys ) ) ;
 
-  } else {
+  }
+  else {
     /** If the query returns no result, there's no book with the given identifier. */
     return filter_xss($identifier);
   }
 }
 
-function dlts_book_api_books($start = 0, $length = 25) {
+function dlts_book_api_books_by_collectionCode ( $collectionCode , $start = 0, $length = 25 , $language ) {
 
-  global $language;
+  $entitiesQuery = new EntityFieldQuery() ;
 
-  $request_uri = drupal_parse_url(request_uri());
+  $countQuery = new EntityFieldQuery();
 
-  if ( isset($request_uri['query']) ) {
-    if ( isset($request_uri['query']['rows']) && is_numeric($request_uri['query']['rows']) ) {
-      $length = $request_uri['query']['rows'];
+  $booksQuery = new EntityFieldQuery() ;
+
+  $entities = $entitiesQuery->entityCondition('entity_type', 'node')
+	                          ->entityCondition('bundle', 'dlts_collection')
+	                          ->propertyCondition('status', 1)
+	                          ->fieldCondition('field_code', 'value', $collectionCode, '=')
+	                          ->execute() ;
+
+	if ( $keys = array_keys ( $entities['node'] ) ) {
+
+		$books = $booksQuery->entityCondition('entity_type', 'node')
+		                    ->entityCondition('bundle', 'dlts_book')
+		                    ->propertyCondition('status', 1)
+		                    ->fieldCondition('field_collection', 'nid', $keys )
+		                    ->propertyCondition('language', $language )
+		                    ->range($start, $length)
+		                    ->execute() ;
+
+		$count = $countQuery->entityCondition('entity_type', 'node')
+		                    ->entityCondition('bundle', 'dlts_book')
+		                    ->fieldCondition('field_collection', 'nid', $keys )
+		                    ->propertyCondition('status', 1)
+		                    ->propertyCondition('language', $language )
+		                    ->count()
+		                    ->execute();
+
+		// try to mimic Solr response
+		$response = array (
+				'response' => array (
+						'numFound' => $count ,
+						'start' => $start ,
+						'docs' => array ( ) ,
+				) ,
+		) ;
+
+		foreach ( (array) node_load_multiple ( array_keys ( $books['node'] ) ) as $node ) {
+			$response['response']['docs'][] = dlts_book_api_book ( $node, FALSE ) ;
+		}
+
+		return $response ;
+
+	}
+
+}
+
+function dlts_book_api_books ( $start = '0', $length = '25' ) {
+
+  $start = '0' ;
+
+  $length = '25' ;
+
+  $language = array ( LANGUAGE_NONE , 'en' ) ;
+
+  $request_uri = drupal_parse_url ( request_uri() ) ;
+
+  if ( isset ( $request_uri['query'] ) ) {
+
+  	if ( isset ( $request_uri['query']['language'] )  ) {
+  		$language = array ( $request_uri['query']['language'] ) ;
+  	}
+
+    if ( isset ( $request_uri['query']['rows'] )  ) {
+    	$length = $request_uri['query']['rows'] ;
     }
-    if ( isset($request_uri['query']['start']) && is_numeric($request_uri['query']['start']) ) {
+
+    if ( isset ( $request_uri['query']['start'] ) ) {
       $start = $request_uri['query']['start'];
     }
+
+    if ( isset ( $request_uri['query']['collectionCode'] ) ) {
+      return dlts_book_api_books_by_collectionCode ( $request_uri['query']['collectionCode'] , $start , $length , $language ) ;
+    }
+
   }
 
   $countQuery = new EntityFieldQuery();
@@ -279,13 +346,12 @@ function dlts_book_api_books($start = 0, $length = 25) {
   );
 
   foreach ( (array) $nodes as $node) {
-    $response['response']['docs'][] = dlts_book_api_book( $node, FALSE);
+    $response['response']['docs'][] = dlts_book_api_book ( $node, FALSE) ;
   }
 
   return $response;
 
 }
-
 
 /**
  * Generate metadata about the first five pages in a DLTS Book.
@@ -298,7 +364,7 @@ function dlts_book_api_books($start = 0, $length = 25) {
 function dlts_book_api_book_pages($book, $start = 0, $length = 25) {
 
   global $language;
-  
+
   module_load_include('inc', 'dlts_utilities', 'inc/dlts_utilities.book');
   module_load_include('inc', 'dlts_utilities', 'inc/dlts_utilities.book_page');
 
@@ -353,6 +419,7 @@ function dlts_book_api_book_pages($book, $start = 0, $length = 25) {
       'page' => dlts_utilities_book_page_get_real_number($node),
       'image' => $master['full_path'],
     	'uri' => $master['uri'],
+    	'fileserver' => str_replace('public://','fileserver://books/', $master['uri'] ),
     	'timestamp' => $master['timestamp'],
         'service' => dlts_utilities_book_page_get_services_image_fullpath($node),
         'hand_side' => dlts_utilities_book_page_get_hand_side($node),
@@ -371,6 +438,64 @@ function dlts_book_api_book_pages($book, $start = 0, $length = 25) {
 
   }
 
+  return $pages;
+}
+
+function dlts_book_api_dlts_book_stitched_page($entity, $start = 0, $length = 25) {
+  if (!is_object($entity) || !isset($entity->nid)) {
+    return MENU_NOT_FOUND;
+  }
+  $pages = array('stitched' => array('page' => array()));
+  // Wrap it with Entity API
+  $ewrapper = entity_metadata_wrapper('node', $entity);
+  $identifier = $ewrapper->field_identifier->value();
+  if (!isset($identifier)) {
+    return MENU_NOT_FOUND;
+  }
+  if (isset($_GET['limit']) && is_numeric($_GET['limit'])) {
+    $length = $_GET['limit'];
+  }
+  if (isset($_GET['start']) && is_numeric($_GET['start'])) {
+    $start = $_GET['start'];
+  }
+  $query = new EntityFieldQuery();
+  $entities = $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'dlts_book_stitched_page')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_is_part_of', 'value', $identifier, '=');
+  if ($length != 0) {
+    $entities->range($start, $length);
+  }
+  $que = $entities->execute();
+  $nodes = entity_load('node', array_keys($que['node']));
+  
+  foreach ((array) $nodes as $node) {
+    $image = $node->field_stitch_image['und'][0];
+    // Wrap it with Entity API
+    $node_ewrapper = entity_metadata_wrapper('node', $node);
+    $pages['stitched']['page'][] = array (
+      'id' => $image['fid'],
+      'sequence' => array(
+        $node_ewrapper->field_sequence_number_left->value(),
+        $node_ewrapper->field_sequence_number_right->value(), 
+      ),
+      'isPartOf' => $identifier,
+      'realPageNumber ' => array(
+        $node_ewrapper->field_page_number_left->value(),
+        $node_ewrapper->field_page_number_right->value(),
+      ),
+      'visible' => 1,      
+      'fileserver' => str_replace('public://','fileserver://books/', $image['uri'] ),
+      'metadata' => array(
+        'width' => $image['djakota_width'],
+        'height' => $image['djakota_height'],
+        'levels' => $image['djakota_levels'],
+        'dwtLevels' => $image['djakota_dwtLevels'],
+        'compositingLayerCount' => $image['djakota_compositingLayerCount'],
+        'timestamp' => time(),
+      ),
+    );
+  }
   return $pages;
 }
 
@@ -408,7 +533,7 @@ function dlts_book_api_embed_using_id( $dlts_book ) {
  *
  * @todo Test oembed_node for whether it's actually a node
  */
-function dlts_book_api_embed_response( $dlts_book, $pre_response = array() ) {
+function dlts_book_api_embed_response($dlts_book, $pre_response = array()) {
 
   /*
    * Invoke the URL that was passed as if it was its own request.
@@ -522,17 +647,73 @@ function dlts_book_api_embed_response( $dlts_book, $pre_response = array() ) {
   return $response;
 }
 
-function dlts_book_api_book( $node, $listPages = TRUE) {
+function dlts_book_api_book_multivol($entity) {
+  $multivol = array('multivolume' => array('volume' => array()));
+  $query = new EntityFieldQuery();
+  $entities = $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'dlts_multivol_book')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_book', 'nid', array($entity->nid), '=')
+    ->execute();
+  if ($entities) {
+    $nid = array_pop(array_keys($entities['node']));
+    $nodes = entity_load('node',array($nid));
+    $node_wrapper = entity_metadata_wrapper('node', array_pop($nodes));
+    $field_collection = $node_wrapper->field_collection->value();
+    $collections = array();
+    if ($field_collection) {
+      foreach ($field_collection as $collection) {
+        $collection_wrapper = entity_metadata_wrapper('node', $collection);
+        $partner = $collection_wrapper->field_partner->value() ;
+        $partner_wrapper = entity_metadata_wrapper('node', $partner[0]);
+        $collections[] = array (
+          'title' => $collection_wrapper->title->value(),
+          'type' => $collection_wrapper->type->value(),
+          'language' => $collection_wrapper->language->value(),
+          'identifier' => $collection_wrapper->field_identifier->value(),
+          'code' => $collection_wrapper->field_code->value(),
+          'name' => $collection_wrapper->field_name->value(),              
+          'partner' => array(
+            'title' => $partner_wrapper->title->value(),
+            'type' => $partner_wrapper->type->value(),          
+            'language' => $partner_wrapper->language->value(),
+            'identifier' => $partner_wrapper->field_identifier->value(),              
+            'code' => $partner_wrapper->field_code->value(),
+            'name' => $partner_wrapper->field_name->value(),                
+          )
+        );    
+      }
+    }
+    $field_multivol = $node_wrapper->field_multivol->value();
+    $multivolume = array();
+    if ($field_multivol) {
+      $m_wrapper = entity_metadata_wrapper('node', $field_multivol);
+      $multivolume[] = array(
+        'title' => $m_wrapper->title->value(),
+        'type' => $m_wrapper->type->value(),
+        'language' => $m_wrapper->language->value(),
+        'identifier' => $m_wrapper->field_identifier->value(),
+        'ri' => $m_wrapper->field_representative_image->value(),
+      );    
+    }
+    $multivol['multivolume']['volume'][] = array(
+      'identifier' => $node_wrapper->field_identifier->value(),
+      'volume_number' =>  $node_wrapper->field_volume_number->value(),
+      'volume_number_str' => $node_wrapper->field_volume_number_str->value(),
+      'collection' => $collections,
+      'isPartOf' => $multivolume,      
+    );
+  }
+  return $multivol;
+}
 
-  $book = dlts_book_api_book_metadata( $node );
-
-  if ( $listPages ) {
-
-    $book =  array_merge( (array) $book, (array) dlts_book_api_book_pages( $node ) ) ;
-
+function dlts_book_api_book($node, $listPages = TRUE) {
+  $book = dlts_book_api_book_metadata($node);
+  $multi = dlts_book_api_book_multivol($node);
+  if ($listPages) {
+    $book =  array_merge( (array)$book, (array)dlts_book_api_book_pages($node), (array)dlts_book_api_dlts_book_stitched_page($node), dlts_book_api_book_multivol($node));
   }
   return $book;
-
 }
 
 /**
@@ -544,11 +725,14 @@ function dlts_book_api_book( $node, $listPages = TRUE) {
  * A keyed array to be converted into JSON
  *
  */
-function dlts_book_api_book_metadata($book) {
-
+function dlts_book_api_book_metadata ( $book ) {
   module_load_include('inc', 'dlts_utilities', 'inc/dlts_utilities.book');
   module_load_include('inc', 'dlts_utilities', 'inc/dlts_utilities.book_page');
   module_load_include('inc', 'dlts_utilities', 'inc/dlts_utilities.collection');
+  $query_parameters = drupal_get_query_parameters();
+  if ( isset ( $query_parameters['getRaw'] ) ) {
+    $getRaw = TRUE;
+  }
 
   $type = dlts_utilities_content_types_type( $book->type );
 
@@ -570,6 +754,8 @@ function dlts_book_api_book_metadata($book) {
   $ewrapper = entity_metadata_wrapper('node', $book);
 
   foreach ( $type['fields'] as $field ) {
+  
+    unset($value);
 
     $name = str_replace('field_', '', $field['field_name']);
 
@@ -580,19 +766,20 @@ function dlts_book_api_book_metadata($book) {
     }
 
     else if ( $field['type'] == 'link_field' && isset( $raw_value['url'] ) ) {
-
       $value = $raw_value['url'];
-
     }
 
     else if ( $field['type'] == 'file_generic' ) {
-
       $value = array();
-
       foreach ( (array) $raw_value as $pdf_file) {
-        $value[] = file_create_url($pdf_file['uri']);
+        if ( $getRaw ) {
+          $pdf_file['fileserver'] = str_replace('public://','fileserver://books/', $pdf_file['uri'] );        
+          $value[] = $pdf_file;
+        }
+        else {
+          $value[] = file_create_url($pdf_file['uri']);
+        }
       }
-
     }
 
     else if ( $field['type'] == 'date_text' ) {
@@ -600,7 +787,14 @@ function dlts_book_api_book_metadata($book) {
     }
 
     else if ( $field['type'] == 'image_image' ) {
-      $value = file_create_url($raw_value['uri']);
+      if ( $getRaw ) {
+        // hack for now
+        $raw_value['fileserver'] = str_replace('public://','fileserver://books/', $raw_value['uri'] );
+        $value = $raw_value;
+      }
+      else {
+        $value = file_create_url($raw_value['uri']);
+      }
     }
 
     else if ( $field['type'] == 'taxonomy_autocomplete' ) {
@@ -612,6 +806,56 @@ function dlts_book_api_book_metadata($book) {
       }
 
     }
+    else if (  strpos ( $field['type'], 'reference') ) {
+      $values = array();
+      foreach ( $raw_value as $reference ) {
+      
+        unset($type);
+      
+        $reference_wrapper = entity_metadata_wrapper('node', $reference);
+        
+        $type = $reference_wrapper->type->value();
+        
+        switch ($type) {
+        
+          case 'dlts_collection' :
+          
+            $partner = $reference_wrapper->field_partner->value() ;
+            
+            $partner_wrapper = entity_metadata_wrapper('node', $partner[0]);
+          
+            $values[] = array (
+              'title' => $reference_wrapper->title->value(),
+              'type' => $type,
+              'language' => $reference_wrapper->language->value(),
+              'identifier' => $reference_wrapper->field_identifier->value(),
+              'code' => $reference_wrapper->field_code->value(),
+              'name' => $reference_wrapper->field_name->value(),              
+              'partner' => array (
+                'title' => $partner_wrapper->title->value(),
+                'type' => $partner_wrapper->type->value(),          
+                'language' => $partner_wrapper->language->value(),
+                'identifier' => $partner_wrapper->field_identifier->value(),              
+                'code' => $partner_wrapper->field_code->value(),
+                'name' => $partner_wrapper->field_name->value(),                
+              ),
+            ) ;          
+            break;
+            
+          case 'dlts_partner' :
+            $values[] = array (
+              'title' => $reference_wrapper->title->value(),
+              'type' => $type,          
+              'language' => $reference_wrapper->language->value(),
+              'identifier' => $reference_wrapper->field_identifier->value(),              
+              'code' => $reference_wrapper->field_code->value(),
+              'name' => $reference_wrapper->field_name->value(),              
+            ) ;          
+            break;
+        }
+      }
+      $value = $values;
+    }
 
     else {
       $value = $raw_value;
@@ -620,16 +864,15 @@ function dlts_book_api_book_metadata($book) {
     $fields[$name] = array (
       'label' => $field['label'],
       'value' => (array) $value,
-      // 'raw_value' => $raw_value,
-      // 'type' => $field['type'],
-      // 'machine_name' => $field['field_name'],
+      'field_type' => $field['type'],
+      'machine_name' => $field['field_name'],
     );
-
+    
   }
 
   $identifier = $fields['identifier']['value'][0];
-
-  return array(
+  
+  return array (
     'entity_title' => !empty($title) ? $title : $book->title,
     'identifier' => $identifier,
     'entity_path' => url('books/' . $identifier . '/1', array('absolute' => TRUE)),
@@ -972,35 +1215,8 @@ function dlts_book_api_content_types() {
 
   }
 
-  // $fields_sorted = array_msort( $fields, array('label' => SORT_ASC));
-
   $out['fields'] = $fields;
 
   return $out;
-
-}
-
-function array_msort($array, $cols)
-{
-    $colarr = array();
-    foreach ($cols as $col => $order) {
-        $colarr[$col] = array();
-        foreach ($array as $k => $row) { $colarr[$col]['_'.$k] = strtolower($row[$col]); }
-    }
-    $eval = 'array_multisort(';
-    foreach ($cols as $col => $order) {
-        $eval .= '$colarr[\''.$col.'\'],'.$order.',';
-    }
-    $eval = substr($eval,0,-1).');';
-    eval($eval);
-    $ret = array();
-    foreach ($colarr as $col => $arr) {
-        foreach ($arr as $k => $v) {
-            $k = substr($k,1);
-            if (!isset($ret[$k])) $ret[$k] = $array[$k];
-            $ret[$k][$col] = $array[$k][$col];
-        }
-    }
-    return $ret;
 
 }
